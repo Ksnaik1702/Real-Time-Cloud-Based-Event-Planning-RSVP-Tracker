@@ -1,0 +1,276 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() { return request.auth != null; }
+    function ownUser(userId) { return signedIn() && request.auth.uid == userId; }
+    function userPath(userId) { return /databases/$(database)/documents/users/$(userId); }
+    function eventPath(eventId) { return /databases/$(database)/documents/events/$(eventId); }
+    function rsvpPath(eventId, userId) { return /databases/$(database)/documents/events/$(eventId)/rsvps/$(userId); }
+    function isOrganizer() {
+      return signedIn() && exists(userPath(request.auth.uid))
+        && get(userPath(request.auth.uid)).data.role == 'organizer';
+    }
+
+    match /users/{userId} {
+      allow read: if ownUser(userId);
+      allow create: if ownUser(userId)
+        && request.resource.data.keys().hasOnly(['displayName', 'email', 'role', 'createdAt'])
+        && request.resource.data.displayName is string
+        && request.resource.data.email == request.auth.token.email
+        && request.resource.data.role in ['attendee', 'organizer'];
+      allow update: if ownUser(userId)
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['displayName', 'email']);
+      allow delete: if false;
+
+      match /notifications/{notificationId} {
+        function validNotification() {
+          return request.resource.data.keys().hasOnly(['eventId', 'type', 'message', 'read', 'createdAt'])
+            && request.resource.data.eventId is string
+            && request.resource.data.type in ['rsvp', 'announcement', 'waitlist', 'cancelled', 'event_update', 'reminder']
+            && request.resource.data.message is string
+            && request.resource.data.read == false;
+        }
+        allow read: if ownUser(userId);
+        allow create: if validNotification() && (ownUser(userId)
+          || (signedIn()
+            && exists(eventPath(request.resource.data.eventId))
+            && get(eventPath(request.resource.data.eventId)).data.createdBy == request.auth.uid
+            && exists(rsvpPath(request.resource.data.eventId, userId))));
+        allow update: if ownUser(userId)
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['read'])
+          && request.resource.data.read == true;
+        allow delete: if ownUser(userId);
+      }
+    }
+
+    match /events/{eventId} {
+      function publicEvent() { return resource.data.status in ['PUBLISHED', 'FULL', 'CANCELLED']; }
+      function eventOwner() { return signedIn() && get(eventPath(eventId)).data.createdBy == request.auth.uid; }
+      function validCounts(counts) {
+        return counts is map
+          && counts.keys().hasOnly(['going', 'maybe', 'notGoing', 'waitlisted'])
+          && counts.going is int && counts.maybe is int && counts.notGoing is int
+          && counts.get('waitlisted', 0) is int
+          && counts.going >= 0 && counts.maybe >= 0 && counts.notGoing >= 0
+          && counts.get('waitlisted', 0) >= 0;
+      }
+      function statusCount(status, expected) {
+        return status == expected ? 1 : 0;
+      }
+      function validAttendeeCounterUpdate() {
+        let path = rsvpPath(eventId, request.auth.uid);
+        let beforeStatus = exists(path) ? get(path).data.status : null;
+        let afterStatus = existsAfter(path) ? getAfter(path).data.status : null;
+        let oldCounts = resource.data.counts;
+        let newCounts = request.resource.data.counts;
+        let oldSeq = resource.data.get('waitlistSequence', 0);
+        let newSeq = request.resource.data.get('waitlistSequence', 0);
+        return signedIn()
+          && beforeStatus != afterStatus
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['counts', 'status', 'updatedAt', 'waitlistSequence'])
+          && validCounts(newCounts)
+          && newCounts.going == oldCounts.going + statusCount(afterStatus, 'GOING') - statusCount(beforeStatus, 'GOING')
+          && newCounts.maybe == oldCounts.maybe + statusCount(afterStatus, 'MAYBE') - statusCount(beforeStatus, 'MAYBE')
+          && newCounts.notGoing == oldCounts.notGoing + statusCount(afterStatus, 'NOT_GOING') - statusCount(beforeStatus, 'NOT_GOING')
+          && newCounts.get('waitlisted', 0) == oldCounts.get('waitlisted', 0) + statusCount(afterStatus, 'WAITLISTED') - statusCount(beforeStatus, 'WAITLISTED')
+          && newSeq == oldSeq + (afterStatus == 'WAITLISTED' && beforeStatus != 'WAITLISTED' ? 1 : 0)
+          && newCounts.going <= resource.data.capacity
+          && request.resource.data.status == (newCounts.going == resource.data.capacity ? 'FULL' : 'PUBLISHED');
+      }
+      function validOwnerPromotion() {
+        let oldCounts = resource.data.counts;
+        let newCounts = request.resource.data.counts;
+        return eventOwner()
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['counts', 'status', 'updatedAt'])
+          && validCounts(newCounts)
+          && newCounts.going == oldCounts.going + 1
+          && newCounts.get('waitlisted', 0) == oldCounts.get('waitlisted', 0) - 1
+          && newCounts.maybe == oldCounts.maybe
+          && newCounts.notGoing == oldCounts.notGoing
+          && newCounts.going <= resource.data.capacity
+          && request.resource.data.status == (newCounts.going == resource.data.capacity ? 'FULL' : 'PUBLISHED');
+      }
+
+      allow read: if publicEvent() || eventOwner();
+      allow create: if isOrganizer()
+        && request.resource.data.createdBy == request.auth.uid
+          && request.resource.data.status == 'PUBLISHED'
+        && request.resource.data.inviteOnly is bool
+        && request.resource.data.capacity is int
+        && request.resource.data.capacity > 0
+        && request.resource.data.counts == {'going': 0, 'maybe': 0, 'notGoing': 0, 'waitlisted': 0}
+        && request.resource.data.waitlistSequence == 0
+        && request.resource.data.keys().hasOnly([
+          'title', 'category', 'date', 'time', 'endTime', 'venue', 'description',
+          'capacity', 'registrationDeadline', 'createdBy', 'organizer', 'counts',
+          'registrationDeadlineAt', 'status', 'createdAt', 'updatedAt', 'waitlistSequence', 'inviteOnly'
+        ]);
+      allow update: if (eventOwner()
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            'announcement', 'updatedAt', 'title', 'category', 'date', 'time', 'endTime',
+            'venue', 'description', 'capacity', 'registrationDeadlineAt', 'status', 'inviteOnly'
+          ])
+          && request.resource.data.status in ['PUBLISHED', 'FULL', 'CANCELLED']
+          && request.resource.data.capacity >= resource.data.counts.going)
+        || validAttendeeCounterUpdate()
+        || validOwnerPromotion();
+      allow delete: if eventOwner();
+
+      match /rsvps/{userId} {
+        function eventData() { return get(eventPath(eventId)).data; }
+        function eventAfter() { return getAfter(eventPath(eventId)).data; }
+        function rsvpBefore() { return exists(rsvpPath(eventId, userId)) ? get(rsvpPath(eventId, userId)).data : null; }
+        function rsvpAfter() { return existsAfter(rsvpPath(eventId, userId)) ? getAfter(rsvpPath(eventId, userId)).data : null; }
+        function invitePath(token) { return /databases/$(database)/documents/events/$(eventId)/invites/$(token); }
+        function inviteAuthorized() {
+          return !eventData().get('inviteOnly', false)
+            || (request.resource.data.inviteToken is string
+              && existsAfter(invitePath(request.resource.data.inviteToken))
+              && getAfter(invitePath(request.resource.data.inviteToken)).data.acceptedBy == userId);
+        }
+        function counted(status, key) {
+          return status == (key == 'going' ? 'GOING' : key == 'maybe' ? 'MAYBE' : key == 'notGoing' ? 'NOT_GOING' : 'WAITLISTED') ? 1 : 0;
+        }
+        function countMatches() {
+          let old = rsvpBefore();
+          let next = rsvpAfter();
+          let oldStatus = old == null ? null : old.status;
+          let newStatus = next == null ? null : next.status;
+          let oldCounts = eventData().counts;
+          let newCounts = eventAfter().counts;
+          let oldSeq = eventData().get('waitlistSequence', 0);
+          let newSeq = eventAfter().get('waitlistSequence', 0);
+          return oldStatus != newStatus
+            && newCounts.going == oldCounts.going + counted(newStatus, 'going') - counted(oldStatus, 'going')
+            && newCounts.maybe == oldCounts.maybe + counted(newStatus, 'maybe') - counted(oldStatus, 'maybe')
+            && newCounts.notGoing == oldCounts.notGoing + counted(newStatus, 'notGoing') - counted(oldStatus, 'notGoing')
+            && newCounts.get('waitlisted', 0) == oldCounts.get('waitlisted', 0) + counted(newStatus, 'waitlisted') - counted(oldStatus, 'waitlisted')
+            && newSeq == oldSeq + (newStatus == 'WAITLISTED' && oldStatus != 'WAITLISTED' ? 1 : 0)
+            && newCounts.going <= eventData().capacity
+            && eventAfter().status == (newCounts.going == eventData().capacity ? 'FULL' : 'PUBLISHED');
+        }
+        function validWaitlistPosition() {
+          let old = rsvpBefore();
+          let oldStatus = old == null ? null : old.status;
+          return request.resource.data.status == 'WAITLISTED'
+            ? request.resource.data.waitlistPosition == eventData().get('waitlistSequence', 0) + (oldStatus == 'WAITLISTED' ? 0 : 1)
+            : !('waitlistPosition' in request.resource.data);
+        }
+        function attendeeRsvpChange() {
+          let old = rsvpBefore();
+          return ownUser(userId)
+            && eventData().createdBy != request.auth.uid
+            && (old == null || old.status != 'WAITLISTED' || request.resource.data.status != 'GOING')
+            && request.resource.data.keys().hasOnly(['userId', 'status', 'respondedAt', 'updatedAt', 'waitlistPosition', 'inviteToken'])
+            && request.resource.data.userId == request.auth.uid
+            && request.resource.data.status in ['GOING', 'MAYBE', 'NOT_GOING', 'WAITLISTED']
+            && eventData().status in ['PUBLISHED', 'FULL']
+            && inviteAuthorized()
+            && (!('registrationDeadlineAt' in eventData()) || eventData().registrationDeadlineAt == null || eventData().registrationDeadlineAt >= request.time)
+            && (request.resource.data.status != 'GOING' || eventData().counts.going < eventData().capacity)
+            && validWaitlistPosition()
+            && countMatches();
+        }
+        function ownerPromoteRsvp() {
+          let old = rsvpBefore();
+          return signedIn()
+            && eventData().createdBy == request.auth.uid
+            && old != null && old.status == 'WAITLISTED'
+            && request.resource.data.userId == userId
+            && request.resource.data.status == 'GOING'
+            && !('waitlistPosition' in request.resource.data)
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'waitlistPosition', 'updatedAt'])
+            && eventData().status in ['PUBLISHED', 'FULL']
+            && eventData().counts.going < eventData().capacity
+            && eventAfter().counts.going == eventData().counts.going + 1
+            && eventAfter().counts.get('waitlisted', 0) == eventData().counts.get('waitlisted', 0) - 1
+            && eventAfter().status == (eventAfter().counts.going == eventData().capacity ? 'FULL' : 'PUBLISHED');
+        }
+        allow read: if signedIn() && (request.auth.uid == userId || eventData().createdBy == request.auth.uid);
+        allow create, update: if attendeeRsvpChange() || ownerPromoteRsvp();
+        allow delete: if ownUser(userId)
+          && eventData().createdBy != request.auth.uid
+          && countMatches();
+      }
+
+      match /announcements/{announcementId} {
+        allow read: if signedIn() && publicEvent();
+        allow create: if eventOwner()
+          && request.resource.data.keys().hasOnly(['title', 'message', 'createdBy', 'createdAt'])
+          && request.resource.data.title is string
+          && request.resource.data.message is string
+          && request.resource.data.createdBy == request.auth.uid;
+        allow update, delete: if eventOwner();
+      }
+
+      match /activity/{activityId} {
+        function activityEvent() { return get(eventPath(eventId)).data; }
+        function validActivity() {
+          let path = rsvpPath(eventId, request.auth.uid);
+          let beforeStatus = exists(path) ? get(path).data.status : 'NONE';
+          let afterStatus = existsAfter(path) ? getAfter(path).data.status : 'REMOVED';
+          return signedIn()
+            && request.resource.data.keys().hasOnly(['userId', 'previousStatus', 'status', 'previousGoing', 'isGoing', 'createdAt'])
+            && request.resource.data.userId == request.auth.uid
+            && request.resource.data.previousStatus == beforeStatus
+            && request.resource.data.status == afterStatus
+            && request.resource.data.previousGoing == (beforeStatus == 'GOING')
+            && request.resource.data.isGoing == (afterStatus == 'GOING')
+            && beforeStatus != afterStatus;
+        }
+        allow read: if signedIn() && (activityEvent().createdBy == request.auth.uid || resource.data.userId == request.auth.uid);
+        allow create: if validActivity();
+        allow update, delete: if false;
+      }
+
+      match /invites/{inviteToken} {
+        allow get: if signedIn() && resource.data.token == inviteToken;
+        allow list: if eventOwner();
+        allow create: if eventOwner()
+          && request.resource.data.keys().hasOnly(['token', 'name', 'email', 'status', 'createdAt'])
+          && request.resource.data.token == inviteToken
+          && request.resource.data.email is string
+          && request.resource.data.status == 'PENDING';
+        allow update: if signedIn()
+          && resource.data.token == inviteToken
+          && (((request.auth.token.email == resource.data.email)
+            && (!('acceptedBy' in resource.data) || resource.data.acceptedBy == request.auth.uid)
+            && request.resource.data.acceptedBy == request.auth.uid
+            && request.resource.data.status == 'ACCEPTED'
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'acceptedBy', 'acceptedAt']))
+            || (request.auth.uid == resource.data.acceptedBy
+              && resource.data.status == 'ACCEPTED'
+              && !('checkedInAt' in resource.data)
+              && exists(rsvpPath(eventId, resource.data.acceptedBy))
+              && get(rsvpPath(eventId, resource.data.acceptedBy)).data.status == 'GOING'
+              && request.resource.data.checkedInBy == request.auth.uid
+              && request.resource.data.checkedInAt is timestamp
+              && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['checkedInAt', 'checkedInBy'])));
+        allow delete: if eventOwner();
+      }
+
+      match /checkins/{userId} {
+        function checkinEvent() { return get(eventPath(eventId)).data; }
+        function checkinRsvp() { return get(rsvpPath(eventId, userId)).data; }
+        function checkinInvite() { return getAfter(/databases/$(database)/documents/events/$(eventId)/invites/$(request.resource.data.inviteToken)).data; }
+        function attendeeCheckin() {
+          let token = request.resource.data.get('inviteToken', '');
+          return ownUser(userId)
+            && checkinEvent().status != 'CANCELLED'
+          && request.resource.data.keys().hasOnly(['userId', 'inviteToken', 'checkedInBy', 'checkedInAt'])
+          && request.resource.data.userId == userId
+          && request.resource.data.checkedInBy == request.auth.uid
+          && checkinRsvp().status == 'GOING'
+            && token == checkinRsvp().get('inviteToken', '')
+            && (!checkinEvent().get('inviteOnly', false) || (token is string && token != ''))
+            && (token == '' || (existsAfter(/databases/$(database)/documents/events/$(eventId)/invites/$(token))
+              && checkinInvite().acceptedBy == userId
+              && checkinInvite().checkedInBy == request.auth.uid));
+        }
+        allow read: if eventOwner() || ownUser(userId);
+        allow create: if attendeeCheckin();
+        allow update, delete: if false;
+      }
+    }
+  }
+}
